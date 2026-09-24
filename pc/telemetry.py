@@ -29,7 +29,8 @@ _SCHEMA = """CREATE TABLE IF NOT EXISTS qa (
 
 # #8/#9/#15 三列（2026-09-24）：answer=transcript-review 层；cloud_tokens=c 腿 usage；
 # runtime_version=ollama /api/version。IF NOT EXISTS 不加列——存量库 PRAGMA 探测后 ALTER。
-_EXTRA_COLS = (("answer", "TEXT"), ("cloud_tokens", "INTEGER"), ("runtime_version", "TEXT"))
+_EXTRA_COLS = (("answer", "TEXT"), ("cloud_tokens", "INTEGER"), ("runtime_version", "TEXT"),
+               ("category_hit", "TEXT"))  # P2 词典命中观测（hit/miss/NULL=无类目槽）
 
 
 _RT_CACHE = {"v": None, "ts": 0.0}               # ponytail: 1h TTL——每问一探会加延迟
@@ -52,7 +53,8 @@ def _runtime_version():
 
 
 def record(entry, question, branch, total_ms, decode_tokens=None,
-           answer_len=0, source="human", answer=None, cloud_tokens=None):
+           answer_len=0, source="human", answer=None, cloud_tokens=None,
+           category_hit=None):
     """单点写入；任何异常只上 stderr（遥测永不打断作答路径）。"""
     try:
         Path(DB).parent.mkdir(parents=True, exist_ok=True)
@@ -65,12 +67,12 @@ def record(entry, question, branch, total_ms, decode_tokens=None,
                     con.execute(f"ALTER TABLE qa ADD COLUMN {col} {typ}")
             con.execute("INSERT INTO qa(ts,entry,source,question,branch,renderer,"
                         "total_ms,decode_tokens,answer_chars,answer,cloud_tokens,"
-                        "runtime_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                        "runtime_version,category_hit) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (time.strftime("%Y-%m-%dT%H:%M:%S"), entry, source,
                          question, branch, RENDERER.get(branch, "template"),
                          int(total_ms), decode_tokens, answer_len,
                          answer[:2000] if answer else None, cloud_tokens,
-                         _runtime_version()))
+                         _runtime_version(), category_hit))
             con.commit()
         finally:
             con.close()

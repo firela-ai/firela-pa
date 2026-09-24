@@ -190,6 +190,13 @@ class Vlt:
         url = f"{self.base}/api/v1/{self.region}/bean/{path}"
         if params:
             url += "?" + "&".join(f"{k}={urllib.parse.quote(str(v))}" for k, v in params.items() if v is not None)
+        return self._get_json(url)
+
+    def _call_flat(self, path):
+        """非 region 面（dir 族全局参照数据：bean/payee-profiles 等，#1504）。"""
+        return self._get_json(f"{self.base}/api/v1/{path}")
+
+    def _get_json(self, url):
         try:
             return _get(url, TIMEOUTS["vlt"], self._auth_header())
         except urllib.error.HTTPError as e:
@@ -263,7 +270,10 @@ def _tx_expense(t):
         return 0.0
 
 
-# 类别同义词（执行器层归一化：口语类别词 → account-standards 英文段；全表应后续交 dir/判例表）
+# 类别同义词（执行器层归一化：口语类别词 → account-standards 英文段）
+# P2 件B（2026-09-24）：过滤面已升级三层合并词典（dir_cache.Matcher——本地词+dir 别名+account 段，
+# 命中面=本表超集）；本表保留两层用途——_metric_hook 预路由扫描（防类别槽污染，不进 dir 别名）
+# 与 dir_cache 未知词回落路径。词典 canonical 源 = vlt dir（/bean/payee-profiles，vlt#1504）。
 CAT_SYNONYMS = {"外卖": "Delivery", "餐饮": "Dining", "吃饭": "Dining", "聚餐": "Dining",
                 "交通": "Transport", "交通费": "Transport", "话费": "Phone", "咖啡": "Coffee",
                 "超市购物": "Groceries", "超市采购": "Groceries", "超市": "Groceries", "买菜": "Groceries"}
@@ -278,7 +288,18 @@ ZH_SYMBOLS = {"贵州茅台": "600519.SS", "茅台": "600519.SS", "五粮液": "
               "平安银行": "000001.SZ", "招商银行": "600036.SS", "工商银行": "601398.SS"}
 
 
-def branch_tx(p, cfg):
+def _cat_match(expenses, cat, cfg):
+    """三层词典过滤（dir_cache.Matcher；命中面=旧版超集）。返回 (命中集, hit 标记)。"""
+    import dir_cache                              # 惰性（环引守卫；eval 可注入 fixture 面）
+    narr_pats, acct_pats = dir_cache.matcher(cfg).patterns(cat)
+    hit = [t for t in expenses
+           if any(pa in t.get("narration", "").casefold() for pa in narr_pats)
+           or any(any(pa in str(p_.get("account", "")).casefold() for pa in acct_pats)
+                  for p_ in t.get("postings", []))]
+    return hit, bool(hit)
+
+
+def branch_tx(p, cfg, trace=None):
     date_from, date_to = normalize_period((p or {}).get("period"), _TODAY())
     page = Vlt(cfg).transactions(date_from, date_to)
     items, truncated = page["data"], page["truncated"]
@@ -287,12 +308,9 @@ def branch_tx(p, cfg):
     if cat in AGG_CATEGORIES:
         cat = None                                         # 聚合词 = 全类查询
     if cat:
-        syn = CAT_SYNONYMS.get(cat, "")
-        expenses = [t for t in expenses
-                    if cat in t.get("narration", "")
-                    or any(cat in str(p_.get("account", ""))
-                           or (syn and syn in str(p_.get("account", "")))
-                           for p_ in t.get("postings", []))]
+        expenses, hit = _cat_match(expenses, cat, cfg)
+        if trace is not None:
+            trace["category_hit"] = "hit" if hit else "miss"   # miss 观测（dogfood 词典缺口数据面）
     total_by_cur = _exp_by_cur(expenses)                # #13：按币种分列（原混币单值——pf 同款纪律）
     parts = " / ".join(f"{c} {v:,.2f}" for c, v in sorted(total_by_cur.items()))
     lines = []
@@ -360,12 +378,14 @@ def _win_txns(vlt, df, dt):
     return page["data"], bool(page.get("truncated"))
 
 
-def _cat_filter(expenses, cat):
-    syn = CAT_SYNONYMS.get(cat, "")
-    return [t for t in expenses
-            if cat in t.get("narration", "")
-            or any(cat in str(p_.get("account", "")) or (syn and syn in str(p_.get("account", "")))
-                   for p_ in t.get("postings", []))]
+def _cat_filter(expenses, cat, cfg=None, trace=None):
+    """度量腿类目过滤（P2 前为 CAT_SYNONYMS 单层；现与 branch_tx 同走三层 Matcher）。"""
+    if not cat:
+        return expenses
+    out, hit = _cat_match(expenses, cat, cfg or {})
+    if trace is not None:
+        trace["category_hit"] = "hit" if hit else "miss"
+    return out
 
 
 def _exp_by_cur(expenses):
@@ -389,7 +409,7 @@ def _inc_by_cur(items):
     return tot
 
 
-def branch_metrics(kind, p, cfg):
+def branch_metrics(kind, p, cfg, trace=None):
     """度量腿：趋势/环比/同比/占比 top-3/储蓄率（月窗 transactions 客户端聚合）。"""
     today = _TODAY()
     vlt = Vlt(cfg)
@@ -402,7 +422,7 @@ def branch_metrics(kind, p, cfg):
         rows, tr = _win_txns(vlt, df, dt)
         exp = [t for t in rows if _tx_expense(t) > 0]
         if cat:
-            exp = _cat_filter(exp, cat)
+            exp = _cat_filter(exp, cat, cfg, trace)
         return _exp_by_cur(exp), tr
 
     def _fmt(tot):
@@ -841,7 +861,9 @@ def handle(question, resolver, cfg, entry="repl", trace=None, source="human"):
     if _mk is None:                                        # FIRE/sim 钩子 + D7 拦截（模拟态优先）
         import sim
         try:
-            if re.search(r"什么时候能退休|多久能退休|多少年能退休|FIRE|财务自由|退休金够不够|when can i retire|financial independence", resolved, re.I):
+            # #23：裸 FIRE/财务自由/financial independence 是概念标记词（gold 走 l/c）——
+            # 概念/讨论题回落受训路由器；钩子只收个人时机形态（时态动词+目标词）
+            if re.search(r"什么时候能(?:退休|财务自由)|多久能(?:退休|财务自由)|多少年能(?:退休|财务自由)|退休金够不够|when can i retire", resolved, re.I):
                 sim.reset(sim.ledger_params(Vlt(cfg), _TODAY()))
                 _prof = memory.get_profile()               # P9：档案覆写会话默认（首问重置后套用）
                 if "wr" in _prof:
@@ -892,7 +914,7 @@ def handle(question, resolver, cfg, entry="repl", trace=None, source="human"):
         if trace is not None:
             trace.update(resolved=resolved, t=t, p=p, parsed=parsed)
         try:
-            out = branch_metrics(kind, p, cfg)
+            out = branch_metrics(kind, p, cfg, trace)
         except VltAuthError as e:
             out = f"账本认证失败：{e}"
         except VltBadResponse as e:
@@ -919,7 +941,7 @@ def handle(question, resolver, cfg, entry="repl", trace=None, source="human"):
         if t == "l":
             out = branch_l(resolved, cfg, gen)
         elif t == "tx":
-            out = branch_tx(p, cfg)
+            out = branch_tx(p, cfg, trace)
         elif t == "pf":
             out = branch_pf(cfg)
         elif t == "mkt":
@@ -943,7 +965,8 @@ def handle(question, resolver, cfg, entry="repl", trace=None, source="human"):
     telemetry.record(entry, question, t, (time.monotonic() - t0) * 1000,
                      decode_tokens=gen.get("eval_count") if t == "l" else None,
                      answer_len=len(out), source=source,   # F1：source 经 handle 透传（eval=synthetic）
-                     answer=out, cloud_tokens=_cloud_tokens if t == "c" else None)  # #8/#9
+                     answer=out, cloud_tokens=_cloud_tokens if t == "c" else None,  # #8/#9
+                     category_hit=(trace or {}).get("category_hit"))  # P2：词典 miss 观测
     return out
 
 

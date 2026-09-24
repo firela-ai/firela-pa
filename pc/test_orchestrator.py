@@ -91,11 +91,11 @@ orchestrator.call_router = lambda q: ("tx", {}, 0, True)
 orchestrator.telemetry.record = lambda *a, **k: None
 
 
-def _tx_bad(p, cfg):
+def _tx_bad(p, cfg, trace=None):
     raise orchestrator.VltBadResponse("列表应答缺 data 键（结构损坏，拒绝报 0 笔）")
 
 
-def _tx_jsonfail(p, cfg):
+def _tx_jsonfail(p, cfg, trace=None):
     raise json.JSONDecodeError("Expecting value", "", 0)
 
 
@@ -117,7 +117,7 @@ _saved = (orchestrator.call_router, orchestrator.branch_tx, orchestrator.branch_
           orchestrator.telemetry.record, orchestrator.normalize_period, orchestrator._TODAY)
 try:
     orchestrator.telemetry.record = lambda *a, **k: captured.update(k)
-    orchestrator.branch_tx = lambda p, cfg: "2026-08-01~2026-08-31 · 3 笔支出，合计 90.50"
+    orchestrator.branch_tx = lambda p, cfg, trace=None: "2026-08-01~2026-08-31 · 3 笔支出，合计 90.50"
 
     # tx 腿：trace 填充 + 模板腿无 raw_out + source 透传
     orchestrator.call_router = lambda q: ("tx", {"period": "2026-08"}, 0, True)
@@ -182,6 +182,131 @@ try:
           "5d 变体正则须只匹配数字+d")
 finally:
     orchestrator.Vlt, orchestrator._TODAY = _saved2
+
+
+# ---- P2 件B：dir 三层词典（命中/回落/离线三态 + 双 canary + trim 用例 + miss 遥测） ----
+_saved3 = (orchestrator.Vlt, orchestrator._TODAY)
+import dir_cache as _dc
+try:
+    _seed = [
+        {"date": "2026-08-01", "narration": "地铁充值",
+         "postings": [{"account": "Expenses:Transportation:PublicTransit", "units": 45.0}]},
+        {"date": "2026-08-02", "narration": "超市买菜-周采购",
+         "postings": [{"account": "Expenses:Food:Groceries", "units": 188.0}]},
+        {"date": "2026-08-03", "narration": "星巴克-拿铁",
+         "postings": [{"account": "Expenses:Food:Dining", "units": 38.0}]},
+        {"date": "2026-08-04", "narration": "肯德基-宅急送",
+         "postings": [{"account": "Expenses:Delivery", "units": 59.0}]},
+    ]
+    orchestrator.Vlt = type("V", (), {"__init__": lambda self, cfg: None,
+                                      "transactions": lambda self, a, b: {"data": _seed, "truncated": False}})
+
+    def _set_dir(profiles):
+        _dc._state["profiles"], _dc._state["ts"] = profiles, __import__("time").time()
+        _dc._matcher = None                      # 单例重建（注入面）
+
+    # 离线/空基线：canary tx-t8（地铁充值→PublicTransit，层3 现役路径）与聚合不受 dir 影响
+    _set_dir([])
+    out = orchestrator.branch_tx({"period": "上个月", "category": "交通费"}, {})
+    check("45.0" in out and "1 笔" in out, f"canary tx-t8 离线态须命中层3（得 {out!r}）")
+
+    # dir 命中态：星巴克别名（层2）+ 快递污染排除（外卖白名单）
+    _set_dir([
+        {"canonical": "starbucks", "aliases": ["星巴克", " sbux "], "category": "CAFE", "subcategory": None},
+        {"canonical": "kfc", "aliases": ["肯德基"], "category": "FAST_FOOD", "subcategory": None},
+        {"canonical": "meituan-waimai", "aliases": ["美团外卖"], "category": "OTHER", "subcategory": "delivery"},
+        {"canonical": "sf-express", "aliases": ["顺丰"], "category": "OTHER", "subcategory": "delivery"},
+    ])
+    _m = _dc.matcher({})
+    narr, acct = _m.patterns("咖啡")
+    check("星巴克" in narr and " sbux" not in narr and "sbux" in narr,
+          f"dir 别名须并入且 strip+casefold（得 {narr!r}）")
+    out = orchestrator.branch_tx({"period": "上个月", "category": "咖啡"}, {})
+    check("38.0" in out, f"咖啡词须经 dir 别名命中星巴克叙述（得 {out!r}）")
+    out = orchestrator.branch_tx({"period": "上个月", "category": "餐饮"}, {})
+    check("38.0" in out and "59.0" in out, f"餐饮四桶并集须含 CAFE+FAST_FOOD（得 {out!r}）")
+    out = orchestrator.branch_tx({"period": "上个月", "category": "外卖"}, {})
+    check("59.0" in out, f"外卖须经白名单别名命中（肯德基宅急送在 Delivery 段——层3；美团外卖叙述）（得 {out!r}）")
+    # 快递污染排除：顺丰别名不得入外卖 narr 模式
+    _narr, _ = _m.patterns("外卖")
+    check("顺丰" not in _narr and "sf-express" not in _narr, f"外卖模式须排除快递公司（得 {_narr!r}）")
+
+    # trim 用例（ADR-0060 #1309 客户端义务）：带空白 alias 仍命中
+    _set_dir([{"canonical": " luckin ", "aliases": [" 瑞幸咖啡 "], "category": "CAFE", "subcategory": None}])
+    _seed.append({"date": "2026-08-05", "narration": "瑞幸咖啡-生椰拿铁",
+                  "postings": [{"account": "Expenses:Food:Dining", "units": 18.0}]})
+    out = orchestrator.branch_tx({"period": "上个月", "category": "咖啡"}, {})
+    check("18.0" in out, f"带空白 alias 须 strip 后仍命中（得 {out!r}）")
+    _seed.pop()
+
+    # miss 遥测：类目过滤零结果 → trace.category_hit=miss
+    _tr = {}
+    orchestrator.branch_tx({"period": "上个月", "category": "话费"}, {}, trace=_tr)
+    check(_tr.get("category_hit") == "miss", f"零结果须记 miss（得 {_tr!r}）")
+    _set_dir([])
+    _tr2 = {}
+    orchestrator.branch_tx({"period": "上个月", "category": "交通费"}, {}, trace=_tr2)
+    check(_tr2.get("category_hit") == "hit", f"命中须记 hit（得 {_tr2!r}）")
+finally:
+    orchestrator.Vlt, orchestrator._TODAY = _saved3
+    _dc._state["profiles"], _dc._state["ts"] = [], 0.0
+    _dc._matcher = None
+
+if FAILS:
+    print(f"FAIL ×{len(FAILS)}")
+    for f in FAILS:
+        print(" -", f)
+    sys.exit(1)
+
+# ---- #23：sim 钩子收窄——概念题走路由、个人时机题进 sim ----
+import types
+
+_router_calls = []
+_saved4 = (orchestrator.call_router, orchestrator.branch_l, orchestrator.telemetry.record,
+           orchestrator.memory, sys.modules.get("sim"))
+try:
+    orchestrator.call_router = lambda q: (_router_calls.append(q), ("l", {}, 0, True))[1]
+    orchestrator.branch_l = lambda q, cfg, stats=None: "L-MARKER：Lean FIRE 与 Fat FIRE 的区别是目标支出水平。"
+    orchestrator.telemetry.record = lambda *a, **k: None
+    orchestrator.memory = types.ModuleType("memory")
+    orchestrator.memory.get_profile = lambda: {}
+
+    _fake = types.ModuleType("sim")
+    _fake.STATE = None
+    _fake.SIM_FORMULA_VERSION = "test-v0"
+    _fake.ledger_params = lambda vlt, today: {}
+    _fake.narrate = lambda ep, wr=None, r=None: "SIM-NARRATE-MARKER"
+
+    def _reset(p):
+        _fake.STATE = types.SimpleNamespace(
+            ttl=99, wr=0.04, r=0.03,
+            effective_params=lambda: {"years": 25}, mutate=lambda q: ("", False))
+    _fake.reset = _reset
+    sys.modules["sim"] = _fake
+
+    _CFG23 = {"vlt_base_url": "http://vlt", "vlt_access_token": "t"}   # Vlt(cfg) 构造在 ledger_params 实参先求值
+
+    # 概念/讨论题（gold=l 形态）：不进 sim，走受训路由器
+    for q in ("财务自由是什么意思啊", "FIRE中的Lean FIRE和Fat FIRE区别是啥？",
+              "财务自由会让你失去工作动力吗"):
+        _router_calls.clear()
+        out = orchestrator.handle(q, _R(), _CFG23, entry="test")
+        check("L-MARKER" in out, f"#23 概念题须走路由不进 sim（{q} → {out!r}）")
+        check(len(_router_calls) == 1, f"#23 概念题须恰好进路由一次（{q}）")
+
+    # 个人时机题（时态动词+目标词）：进 sim，不进路由
+    for q in ("我什么时候能退休", "我什么时候能财务自由", "按现在这样还要多少年能退休"):
+        _router_calls.clear()
+        out = orchestrator.handle(q, _R(), _CFG23, entry="test")
+        check("SIM-NARRATE-MARKER" in out, f"#23 个人时机题须进 sim（{q} → {out!r}）")
+        check(not _router_calls, f"#23 个人时机题不得进路由（{q}）")
+finally:
+    (orchestrator.call_router, orchestrator.branch_l, orchestrator.telemetry.record,
+     orchestrator.memory) = _saved4[:4]
+    if _saved4[4] is None:
+        sys.modules.pop("sim", None)
+    else:
+        sys.modules["sim"] = _saved4[4]
 
 if FAILS:
     print(f"FAIL ×{len(FAILS)}")
