@@ -821,6 +821,8 @@ def _mem_gate(resolved, source):
 
 
 def handle(question, resolver, cfg, entry="repl", trace=None, source="human"):
+    if trace is None:
+        trace = {}                 # dogfood R1：CLI/REPL 缺省无 trace → category_hit 观测断线——内部统一字典
     t0 = time.monotonic()
     gen = {}                                               # branch_l 出参容器（每问局部，并发安全）
     _ctx = None                                            # P8 c 腿数据上下文（None=不带）

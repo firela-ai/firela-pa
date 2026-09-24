@@ -300,6 +300,19 @@ try:
         out = orchestrator.handle(q, _R(), _CFG23, entry="test")
         check("SIM-NARRATE-MARKER" in out, f"#23 个人时机题须进 sim（{q} → {out!r}）")
         check(not _router_calls, f"#23 个人时机题不得进路由（{q}）")
+
+    # dogfood R1：CLI/REPL 缺省（无 trace 实参）category_hit 观测不得断线
+    _cap = {}
+    try:
+        orchestrator.telemetry.record = lambda *a, **k: _cap.update(k)
+        orchestrator.branch_tx = lambda p, cfg, trace=None: trace.update(category_hit="miss") or "0 笔"
+        orchestrator.call_router = lambda q: ("tx", {"category": "咖啡"}, 0, True)
+        orchestrator.handle("上个月咖啡花了多少", _R(), {}, entry="test")   # 无 trace 实参
+        check(_cap.get("category_hit") == "miss",
+              f"缺省 trace 路径 category_hit 须落遥测（得 {_cap.get('category_hit')!r}）")
+    finally:
+        (orchestrator.call_router, orchestrator.branch_tx,
+         orchestrator.telemetry.record) = _saved4[0], _saved4[1], _saved4[2]
 finally:
     (orchestrator.call_router, orchestrator.branch_l, orchestrator.telemetry.record,
      orchestrator.memory) = _saved4[:4]
