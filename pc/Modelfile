@@ -1,0 +1,27 @@
+# firela-router: fine-tuned Qwen3-1.7B privacy router (fmt-v1.1), PC form P1
+# TEMPLATE tail is load-bearing: training (LLaMA-Factory qwen3, enable_thinking:false)
+# put the empty think block on the PROMPT side — the model never emits <think> itself.
+# PARAMETER think does not exist (ollama#14809); never send per-request think:false.
+#
+# ⚠️ EMPIRICAL CONTRACT (2026-09-19): Ollama 0.34 marks this model "thinking"-
+# capable and STRIPS the empty-think block from TEMPLATE rendering — template-mode
+# calls go out-of-distribution and the model emits its own <think>. Callers MUST
+# use raw=true with the exact training string (see pc/eval_router.py wrap_raw()).
+# The TEMPLATE below is bypassed by raw calls; kept only so non-raw misuse fails
+# visibly instead of silently.
+FROM ./models/router-merged-Q8_0.gguf
+TEMPLATE """{{- if .System }}<|im_start|>system
+{{ .System }}<|im_end|>
+{{ end }}<|im_start|>user
+{{ .Prompt }}<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+"""
+PARAMETER temperature 0
+PARAMETER repeat_penalty 1.0
+PARAMETER num_ctx 1024
+PARAMETER num_predict 64
+PARAMETER stop "<|im_end|>"

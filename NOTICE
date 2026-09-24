@@ -1,0 +1,17 @@
+firela-pa
+Copyright 2026 the firela-pa maintainer
+
+This product includes software from the firela-pa project
+(https://github.com/firela-ai/firela-pa), licensed under the Apache
+License, Version 2.0. See LICENSE for the full license text.
+
+The routing model distributed with this product (router-merged-*.gguf,
+"firela-router"; weights ship separately via the HF distribution) is a
+LoRA fine-tune merge derivative of Qwen3-1.7B,
+© 2024 Alibaba Cloud (Qwen team), licensed under Apache-2.0:
+https://huggingface.co/Qwen/Qwen3-1.7B
+
+"Firela" and "firela-pa" are product names of the maintainer.
+The Apache-2.0 license does not grant trademark rights; forks and
+modified redistributions must use their own name (see README).
+"Sovereign Personal AI" is a category term, not claimed as a trademark.
