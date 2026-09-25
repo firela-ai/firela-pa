@@ -74,7 +74,8 @@ fi
 BUILD_DATE=$(sed -n 's/^build_date=//p' "$DEST/VERSION" 2>/dev/null) || true   # 旧 tarball 无 VERSION → 空串容错（set -e）
 GIT_HEAD=$(sed -n 's/^git_head=//p' "$DEST/VERSION" 2>/dev/null) || true
 (umask 077; printf 'build_date=%s\ngit_head=%s\napp_sha256=%s\ninstall_date=%s\n' \
-  "${BUILD_DATE:-unknown}" "${GIT_HEAD:-none}" "$NEW_SHA" "$(date +%F)" > "$DEST/VERSION")
+  "${BUILD_DATE:-unknown}" "${GIT_HEAD:-none}" "$NEW_SHA" "$(date +%F)" > "$DEST/VERSION"
+ chmod 600 "$DEST/VERSION")   # 首装验收：tar 解出的旧文件 644，printf 截断保模式——umask 只管新建，须显式收权
 
 # ---------- 3. 路由模型（sha256 校验，已存在且匹配则跳过） ----------
 GGUF_PATH="$DEST/models/$ROUTER_GGUF"
@@ -180,7 +181,8 @@ if [ -w /usr/local/bin ]; then ln -sf "$DEST/bin/firela-pa" /usr/local/bin/firel
 elif [[ ":$PATH:" == *":$HOME/.local/bin:"* ]]; then mkdir -p "$HOME/.local/bin"; ln -sf "$DEST/bin/firela-pa" "$HOME/.local/bin/firela-pa"; BIN_OK=1
 fi
 if [ "${BIN_OK:-0}" = 1 ]; then say "命令已就绪：firela-pa \"你的问题\"（或 python3 $DEST/orchestrator.py）"
-else say "把以下行加进 shell 配置后即可用 firela-pa 命令：\n  export PATH=\"\$PATH:$DEST/bin\""
+else say "命令未入 PATH——把以下行加进 shell 配置后即可用 firela-pa："
+  say "  export PATH=\"\$PATH:$DEST/bin\""
 fi
 
 # ---------- 9. 冒烟（l 分支 = 无需任何 token 即答） ----------
