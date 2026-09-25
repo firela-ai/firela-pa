@@ -7,6 +7,7 @@
 
 import json
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -247,6 +248,54 @@ try:
     _tr2 = {}
     orchestrator.branch_tx({"period": "上个月", "category": "交通费"}, {}, trace=_tr2)
     check(_tr2.get("category_hit") == "hit", f"命中须记 hit（得 {_tr2!r}）")
+
+    # ---- #26：词族扩容 + 变体包含归一 --------------------------------------------
+    # 词表 enum 桶合法性：全部 ∈ vlt PayeeProfileCategory 23 值（防拼错 enum 名 dir 分组静默落空）
+    _VLT_ENUMS = {"RESTAURANT", "CAFE", "FAST_FOOD", "BAR", "SUPERMARKET", "CONVENIENCE_STORE",
+                  "SHOPPING_MALL", "ONLINE_SHOPPING", "TAXI", "RIDE_SHARING", "PUBLIC_TRANSPORT",
+                  "PARKING", "GAS_STATION", "UTILITIES", "TELECOM", "STREAMING", "HEALTHCARE",
+                  "EDUCATION", "ENTERTAINMENT", "SPORTS", "TRAVEL", "HOTEL", "OTHER"}
+    bad = {e for _, (enums, _) in _dc.LOCAL_CAT_WORDS.items() for e in enums if e not in _VLT_ENUMS}
+    check(not bad, f"词表 enum 桶须 ∈ vlt PayeeProfileCategory（越界 {bad}）")
+    # 新词族段词就位（account 段 = 命中面的现役路径）
+    for w, seg in [("订阅", "subscription"), ("购物", "shopping"), ("娱乐", "entertainment"),
+                   ("油费", "gas"), ("水电", "utilities"), ("便利店", "convenience"), ("房租", "rent")]:
+        _, _a = _m.patterns(w)
+        check(seg in _a, f"新词 {w} 的 account 段须含 {seg}（得 {_a!r}）")
+    # 空枚举互斥：房租/rent 不得并入外卖白名单别名
+    _narr_r, _ = _m.patterns("rent")
+    check("meituan" not in _narr_r and "美团" not in _narr_r, f"rent 空枚举不得继承外卖白名单（得 {_narr_r!r}）")
+    # 变体包含归一：未知词含已知词/段词 → 沿用该行 spec
+    _n, _a = _m.patterns("话费账单")
+    check("话费" in _n and "phone" in _a, f"话费账单须归一到话费行（narr={_n!r} acct={_a!r}）")
+    _, _a = _m.patterns("水电燃气")
+    check("utilities" in _a, f"水电燃气须归一到水电行（得 {_a!r}）")
+    _, _a = _m.patterns("rent杂费")
+    check("rent" in _a, f"rent杂费须归一到 rent 行（得 {_a!r}）")
+    _, _a = _m.patterns("entertainment")           # 英文段包含：entertainment ⊃ Entertainment 段
+    check("entertainment" in _a, f"entertainment 须经段词归一到娱乐行（得 {_a!r}）")
+    _, _a = _m.patterns("educational")             # 词首命中允许派生后缀
+    check("education" in _a, f"educational 须归一到教育行（得 {_a!r}）")
+    # ASCII 词首边界：词中 rent 不得误中（current/parent → verbatim 回落）
+    for _w in ("current", "parent"):
+        _n, _ = _m.patterns(_w)
+        check(_n == [_w], f"{_w} 词中含 rent 须 verbatim 不误归一（得 {_n!r}）")
+    # 歧义不猜 + 真未知走旧 verbatim 路径（超集保证不回归）
+    _n, _ = _m.patterns("水电娱乐")                # 含两个不同 spec 的词 → 不猜
+    check(_n == ["水电娱乐"], f"多 spec 歧义词须 verbatim 回落（得 {_n!r}）")
+    _n, _a = _m.patterns("宠物")
+    check(_n == ["宠物"] and "宠物" in _a, f"真未知词须旧版逐字保留（narr={_n!r}）")
+    # 端到端：变体词经归一命中账本段（星巴克行在 Expenses:Food:Dining；订阅须 Subscriptions 段交易）
+    _seed.append({"date": "2026-08-06", "narration": "ChatGPT Plus 订阅",
+                  "postings": [{"account": "Expenses:Subscriptions:General", "units": 150.0}]})
+    try:
+        _set_dir([])                              # 离线态：纯词表面（隔离 dir 别名）
+        out = orchestrator.branch_tx({"period": "上个月", "category": "外出就餐"}, {})
+        check("38.0" in out, f"外出就餐须归一后就餐行命中 Dining 段（得 {out!r}）")
+        out = orchestrator.branch_tx({"period": "上个月", "category": "订阅服务"}, {})
+        check("150.0" in out, f"订阅服务须归一命中 Subscriptions 段+订阅叙述（得 {out!r}）")
+    finally:
+        _seed.pop()
 finally:
     orchestrator.Vlt, orchestrator._TODAY = _saved3
     _dc._state["profiles"], _dc._state["ts"] = [], 0.0
@@ -303,6 +352,7 @@ try:
 
     # dogfood R1：CLI/REPL 缺省（无 trace 实参）category_hit 观测不得断线
     _cap = {}
+    _bt = orchestrator.branch_tx              # 桩前捕获（_saved4 未含 branch_tx——曾误恢复成 branch_l）
     try:
         orchestrator.telemetry.record = lambda *a, **k: _cap.update(k)
         orchestrator.branch_tx = lambda p, cfg, trace=None: trace.update(category_hit="miss") or "0 笔"
@@ -312,7 +362,7 @@ try:
               f"缺省 trace 路径 category_hit 须落遥测（得 {_cap.get('category_hit')!r}）")
     finally:
         (orchestrator.call_router, orchestrator.branch_tx,
-         orchestrator.telemetry.record) = _saved4[0], _saved4[1], _saved4[2]
+         orchestrator.telemetry.record) = _saved4[0], _bt, _saved4[2]
 finally:
     (orchestrator.call_router, orchestrator.branch_l, orchestrator.telemetry.record,
      orchestrator.memory) = _saved4[:4]
@@ -320,6 +370,107 @@ finally:
         sys.modules.pop("sim", None)
     else:
         sys.modules["sim"] = _saved4[4]
+
+# ---- #24：REPL exit/quit 须在 handle 前断出（不进路由、不落遥测） ----
+import builtins
+
+_handled = []
+_saved5 = (builtins.input, orchestrator.handle, orchestrator.load_config,
+           orchestrator.CONFIG_PATH, sys.argv, sys.modules.get("audit"))
+try:
+    orchestrator.handle = lambda q, *a, **k: _handled.append(q) or "MARKER"
+    orchestrator.load_config = lambda: {}
+    orchestrator.CONFIG_PATH = Path(__file__)          # exists() 过闸即可（load_config 已打桩）
+    sys.argv = ["orchestrator.py"]
+
+    _audit = types.ModuleType("audit")
+    _audit.startup_audit = lambda cfg: None
+    sys.modules["audit"] = _audit
+
+    for cmd in ("exit", "quit"):
+        _handled.clear()
+        builtins.input = lambda *a, _c=cmd: _c
+        orchestrator.main()
+        check(not _handled, f"#24 REPL 输入 {cmd!r} 须直接退出、不进 handle")
+
+    _handled.clear()
+    _feed = iter(["这个月花了多少", "exit"])
+    builtins.input = lambda *a: next(_feed)
+    orchestrator.main()
+    check(_handled == ["这个月花了多少"],
+          f"#24 普通问句后 exit 须正常退出且仅处理一问（{_handled!r}）")
+finally:
+    (builtins.input, orchestrator.handle, orchestrator.load_config,
+     orchestrator.CONFIG_PATH, sys.argv) = _saved5[:5]
+    if _saved5[5] is None:
+        sys.modules.pop("audit", None)
+    else:
+        sys.modules["audit"] = _saved5[5]
+
+if FAILS:
+    print(f"FAIL ×{len(FAILS)}")
+    for f in FAILS:
+        print(" -", f)
+    sys.exit(1)
+
+# ---- #27：p 槽噪声归一（余额→pf / 转账诚实 / meta 剥离 / topn 守卫扩展）----
+for cat, want in (("总支出", None), ("支出结构", None), ("支出排行", None),
+                  ("交易记录", None), ("交易查询", None), ("购物明细", "购物"),
+                  ("话费扣款记录", "话费扣款"), ("外卖", "外卖"), ("转账", "转账"), ("", "")):
+    got = orchestrator.norm_category(cat)
+    check(got == want, f"#27 norm_category({cat!r}) 须得 {want!r}（得 {got!r}）")
+for q, want in (("看下支出结构", ("topn", {})), ("上季度支出排行", ("topn", {"period": "上个季度"})),
+                ("记账软件排行榜前十名都有哪些啊", None), ("我的支出结构有什么可以优化的", None)):
+    got = orchestrator._metric_hook(q)
+    check(got == want, f"#27 _metric_hook({q!r}) 须得 {want!r}（得 {got!r}）")
+
+_saved5 = (orchestrator.call_router, orchestrator.branch_pf, orchestrator.branch_tx,
+           orchestrator.telemetry.record)
+try:
+    # handle：余额形 reroute → pf（trace/遥测分支随动）
+    orchestrator.telemetry.record = lambda *a, **k: None
+    orchestrator.call_router = lambda q: ("tx", {"category": "余额"}, 0, True)
+    orchestrator.branch_pf = lambda cfg: "PF-MARKER：资产全景"
+    _tr = {}
+    out = orchestrator.handle("查一下我微信钱包零钱还有多少", _R(), {}, entry="test", trace=_tr)
+    check("PF-MARKER" in out and _tr.get("t") == "pf",
+          f"#27 余额形须 reroute pf（得 t={_tr.get('t')!r}, out={out!r}）")
+
+    # #28：信用/花呗账单形（负债余额形状）同辖 reroute pf——禁 0 笔假答案
+    for _cat, _q in (("信用卡待还", "帮我check下信用卡本月待还amount"),
+                     ("花呗账单", "花呗这个月账单多少了")):
+        orchestrator.call_router = lambda q, _c=_cat: ("tx", {"category": _c}, 0, True)
+        _tr = {}
+        out = orchestrator.handle(_q, _R(), {}, entry="test", trace=_tr)
+        check("PF-MARKER" in out and _tr.get("t") == "pf",
+              f"#28 {_cat} 须 reroute pf（得 t={_tr.get('t')!r}, out={out!r}）")
+
+    # branch_tx：转账 → 诚实不支持（不进过滤、不记 miss）
+    _tr2 = {}
+    out = orchestrator.branch_tx({"period": "本月", "category": "转账记录"}, {}, trace=_tr2)
+    check("转账" in out and "不支持" in out, f"#27 转账须诚实答复（得 {out!r}）")
+    check("category_hit" not in _tr2, f"#27 转账不得记 category_hit（得 {_tr2!r}）")
+finally:
+    (orchestrator.call_router, orchestrator.branch_pf, orchestrator.branch_tx,
+     orchestrator.telemetry.record) = _saved5
+
+# ---- #25：版本问句确定性自报（不进路由、零 LLM）；正反例 ----
+_orig_vp, _orig_rec = orchestrator._VERSION_PATH, orchestrator.telemetry.record
+orchestrator.telemetry.record = lambda *a, **k: None
+try:
+    with tempfile.TemporaryDirectory() as _td:
+        orchestrator._VERSION_PATH = Path(_td) / "VERSION"
+        orchestrator._VERSION_PATH.write_text(
+            "build_date=2026-09-25\ngit_head=abc1234\napp_sha256=deadbeef00\ninstall_date=2026-09-25\n")
+        for q in ("这是我的版本信息，请问还有其他问题吗？", "你是什么版本"):
+            out = orchestrator.handle(q, _R(), {}, entry="test")
+            check("2026-09-25" in out and "deadbeef" in out, f"#25 版本问句须自报戳（{q} → {out!r}）")
+    orchestrator._VERSION_PATH = _orig_vp
+    check("开发布局" in orchestrator.version_reply(), "#25 无戳须兜底文案")
+finally:
+    orchestrator._VERSION_PATH, orchestrator.telemetry.record = _orig_vp, _orig_rec
+check(not orchestrator._VERSION_Q_RE.search("苹果最新版本手机值得买吗"),
+      "#25 产品版本题不得误拦")
 
 if FAILS:
     print(f"FAIL ×{len(FAILS)}")

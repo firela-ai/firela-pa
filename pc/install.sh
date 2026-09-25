@@ -53,13 +53,28 @@ esac
 
 # ---------- 2. 应用文件 ----------
 mkdir -p "$DEST/models" "$DEST/bin"
+OLD_STAMP=$(cat "$DEST/VERSION" 2>/dev/null || true)     # #25：解包前留旧戳（解包会覆盖）
 say "下载应用（${HF_REPO}）…"
 curl -fsSL "$HF/pc-app.tar.gz" -o "$DEST/pc-app.tar.gz"
 curl -fsSL "$HF/pc-app.tar.gz.sha256" -o "$DEST/pc-app.tar.gz.sha256"
-[ "$(file_sha "$DEST/pc-app.tar.gz")" = "$(awk '{print $1}' "$DEST/pc-app.tar.gz.sha256")" ] \
+NEW_SHA=$(file_sha "$DEST/pc-app.tar.gz")
+[ "$NEW_SHA" = "$(awk '{print $1}' "$DEST/pc-app.tar.gz.sha256")" ] \
   || die "应用包 sha256 不符——重跑本脚本重试"
 tar xzf "$DEST/pc-app.tar.gz" -C "$DEST"
 [ -f "$DEST/orchestrator.py" ] || die "应用包解包失败"
+
+# ---------- 2.5 版本戳（#25：装机自报身份 + 滞后信号；对比在覆盖前） ----------
+OLD_SHA=$(printf '%s\n' "$OLD_STAMP" | sed -n 's/^app_sha256=//p')
+if [ -n "$OLD_STAMP" ] && [ "$OLD_SHA" = "$NEW_SHA" ]; then
+  say "已是最新（$(printf '%s\n' "$OLD_STAMP" | sed -n 's/^build_date=//p') / ${NEW_SHA:0:8}）"
+elif [ -n "$OLD_STAMP" ]; then
+  OLD_SHA8=${OLD_SHA:0:8}
+  say "升级 ${OLD_SHA8:-旧戳缺sha} → ${NEW_SHA:0:8}"
+fi
+BUILD_DATE=$(sed -n 's/^build_date=//p' "$DEST/VERSION" 2>/dev/null) || true   # 旧 tarball 无 VERSION → 空串容错（set -e）
+GIT_HEAD=$(sed -n 's/^git_head=//p' "$DEST/VERSION" 2>/dev/null) || true
+(umask 077; printf 'build_date=%s\ngit_head=%s\napp_sha256=%s\ninstall_date=%s\n' \
+  "${BUILD_DATE:-unknown}" "${GIT_HEAD:-none}" "$NEW_SHA" "$(date +%F)" > "$DEST/VERSION")
 
 # ---------- 3. 路由模型（sha256 校验，已存在且匹配则跳过） ----------
 GGUF_PATH="$DEST/models/$ROUTER_GGUF"

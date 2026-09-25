@@ -40,6 +40,7 @@ import verify                                       # noqa: E402  数字对账�
 import memory                                       # noqa: E402  代理记忆（P9，本地腿专用）
 
 CONFIG_PATH = Path.home() / ".firela-pa" / "config.toml"
+_VERSION_PATH = _HERE / "VERSION"        # #25：安装布局=~/.firela-pa/VERSION（打包器写 build 期，install.sh 补 sha）；开发布局无戳
 OLLAMA = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 ROUTER_MODEL = "firela-router"
 TIMEOUTS = {"router": 30, "vlt": 15, "openbb": 15, "relay": 120, "gen": 120}
@@ -281,6 +282,26 @@ CAT_SYNONYMS = {"外卖": "Delivery", "餐饮": "Dining", "吃饭": "Dining", "�
 # 归一层归一，与期间口语值同辖区——agent eval 真基线 2026-09-23 发现）
 AGG_CATEGORIES = {"总支出", "支出总额", "总消费", "全部支出", "全部消费", "支出", "总花销",
                   "花销", "消费总额", "总花费", "花费总额"}
+# p 槽 meta 词（#27）：路由器把叙述形词当类目输出（购物明细/交易记录/支出排行）——
+# 纯 meta 骨架 → 全类；尾缀剥离后剩真类目（词典残余归 #26 contains-scan）。
+META_CATEGORIES = {"交易", "记录", "明细", "查询", "流水"}
+_META_SUFFIX = ("明细", "记录", "查询", "排行", "结构", "统计")
+BALANCE_CATEGORIES = {"余额", "零钱", "信用卡待还", "花呗账单"}   # 账户余额形状（误标 tx+category）→ pf；
+                                                # #28：信用/花呗账单形=负债余额形状同辖（禁 0 笔假答案）
+TRANSFER_CATEGORIES = {"转账"}                # 非 Expenses 类目 → 诚实不支持（禁 0 笔假答案）
+
+
+def norm_category(cat):
+    """p 槽类目归一（AGG_CATEGORIES 扩展，#27）：聚合词/纯 meta → None（全类）；
+    叙述形尾缀递归剥离（支出结构→支出→AGG→None；购物明细→购物）。真类目词原样。"""
+    if not cat:
+        return cat
+    if cat in AGG_CATEGORIES or cat in META_CATEGORIES:
+        return None
+    for suf in _META_SUFFIX:
+        if cat.endswith(suf) and len(cat) > len(suf):
+            return norm_category(cat[:-len(suf)])
+    return cat
 # 中文标的映射（yfinance 不认中文名；全表应后续交 dir 商家/机构库）
 ZH_SYMBOLS = {"贵州茅台": "600519.SS", "茅台": "600519.SS", "五粮液": "000858.SZ",
               "腾讯": "0700.HK", "阿里巴巴": "BABA", "宁德时代": "300750.SZ",
@@ -300,13 +321,14 @@ def _cat_match(expenses, cat, cfg):
 
 
 def branch_tx(p, cfg, trace=None):
+    cat = norm_category((p or {}).get("category"))         # 聚合词/meta 词归一（#27 收口 AGG）
+    if cat in TRANSFER_CATEGORIES:                         # 转账非支出——诚实不支持先答，不取数不报 0 笔
+        return ("转账（资金划转）不是支出类目，当前版本不支持转账查询——这不是「没有转账」。"
+                "可问支出统计（「这个月花了多少」）或资产全景（「我的净资产」）。")
     date_from, date_to = normalize_period((p or {}).get("period"), _TODAY())
     page = Vlt(cfg).transactions(date_from, date_to)
     items, truncated = page["data"], page["truncated"]
     expenses = [t for t in items if _tx_expense(t) > 0]
-    cat = (p or {}).get("category")
-    if cat in AGG_CATEGORIES:
-        cat = None                                         # 聚合词 = 全类查询
     if cat:
         expenses, hit = _cat_match(expenses, cat, cfg)
         if trace is not None:
@@ -532,7 +554,11 @@ def _metric_hook(q):
             p["month"] = (_MONTHS_CN.get(mm.group(1)) or _MONTHS_CN.get(mm.group(1) + "月")
                           or _TODAY().month)                # 未识别月兜底当月
         return "yoy", p
-    if re.search(r"占比|花在哪|大头|主要花|构成", q):
+    # #27 新支线三重守卫：排行/结构 + 支出语境 + 建议动词否决——裸词会劫走
+    # 「记账软件排行榜」(l)/「资产结构有什么变化」(pf)/「支出结构…优化」(c) 三族
+    if re.search(r"占比|花在哪|大头|主要花|构成", q) or (
+            re.search(r"排行|结构", q) and re.search(r"支出|消费|花", q)
+            and not re.search(r"优化|建议|调整|隐患|分析|怎么(办|改|调)", q)):
         return "topn", p
     return None
 
@@ -741,6 +767,41 @@ _QUICK_REPLIES = (
 )
 
 
+# ---------- #25 版本戳：装机自报身份 + 滞后信号 ----------
+
+_VERSION_Q_RE = re.compile(r"版本信息|版本号|版本是多少|[你我什么咱]的?版本")
+
+
+def _read_stamp():
+    try:
+        return dict(l.split("=", 1) for l in _VERSION_PATH.read_text().splitlines() if "=" in l)
+    except OSError:
+        return None
+
+
+def version_reply():
+    v = _read_stamp()                                  # --version 与版本问句共用出口
+    if not v:
+        return "我在开发布局下运行，无版本戳（正式安装带 VERSION：构建日期+包 sha256）。"
+    parts = []
+    if v.get("build_date"):
+        parts.append(f"构建 {v['build_date']}")
+    if v.get("git_head") and v["git_head"] != "none":
+        parts.append(f"git {v['git_head']}")
+    if v.get("app_sha256"):
+        parts.append(f"包 sha {v['app_sha256'][:8]}")
+    if v.get("install_date"):
+        parts.append(f"装机 {v['install_date']}")
+    return "我是 firela-pa PC（" + "、".join(parts) + "）。更新：重跑安装命令。"
+
+
+def version_short():
+    v = _read_stamp()                                  # banner 短戳（无戳/无日期则空）
+    if v and v.get("build_date"):
+        return f"{v['build_date']}/{v['app_sha256'][:8]}" if v.get("app_sha256") else v["build_date"]
+    return ""
+
+
 def _sim_tail(entry, resolved, question, t0, t, out, source, resolver):
     resolver.update(resolved, t, {})                 # 与其他分支一致：喂 resolved（非原始问句）
     telemetry.record(entry, question, t, (time.monotonic() - t0) * 1000,
@@ -840,6 +901,14 @@ def handle(question, resolver, cfg, entry="repl", trace=None, source="human"):
             telemetry.record(entry, question, t, (time.monotonic() - t0) * 1000,
                              answer_len=len(out), source=source)
             return out
+    if _VERSION_Q_RE.search(resolved):                 # #25：版本问句确定性自报（零 LLM，镜像快答形状）
+        t, p, x, parsed = "l", {}, 0, True
+        if trace is not None:
+            trace.update(resolved=resolved, t=t, p=p, parsed=parsed)
+        out = version_reply()
+        telemetry.record(entry, question, t, (time.monotonic() - t0) * 1000,
+                         answer_len=len(out), source=source)
+        return out
     if _MEM_TRIGGER.search(resolved):
         t, p, x, parsed = "mem", {}, 0, True               # P9 保存门：锚定触发、不落穿路由
         if trace is not None:
@@ -928,6 +997,8 @@ def handle(question, resolver, cfg, entry="repl", trace=None, source="human"):
                          answer_len=len(out), source=source)
         return out
     t, p, x, parsed = call_router(resolved)
+    if parsed and t == "tx" and (p or {}).get("category") in BALANCE_CATEGORIES:
+        t, p = "pf", {}             # #27 账户余额形状误标 tx+category → pf 资产全景
     if not parsed:
         t, p, x = "c", {}, 0                               # 分支标签记 c（评测分支门口径）；处置见下——不上云（#14）
     if trace is not None:                                  # 观测缝（镜像 branch_l stats 先例；eval_agent 用）
@@ -1057,6 +1128,9 @@ def main():
     if "--template" in argv:
         print(CONFIG_TEMPLATE.format(path=CONFIG_PATH))
         return
+    if "--version" in argv:                            # #25：config 检查前——未配置/滞后装机也要能自报
+        print(version_reply())
+        return
     voice_on = "--voice" in argv
     argv = [a for a in argv if a != "--voice"]
     serve_on = "--serve" in argv
@@ -1087,7 +1161,9 @@ def main():
         return
     import audit                                           # P10 启动补审：仅 REPL（argv/serve/voice 已 return——单发 CLI 管道零污染）
     audit.startup_audit(cfg)
-    print("firela-pa PC v0（exit/Ctrl-D 退出；--voice 语音；--serve 开 web）")
+    _vs = version_short()
+    print("firela-pa PC v0（exit/quit/Ctrl-D 退出；--voice 语音；--serve 开 web）"
+          + (f" — build {_vs}" if _vs else ""))
     while True:
         try:
             q = input("你> ").strip()
@@ -1095,6 +1171,8 @@ def main():
             break
         if not q:
             continue
+        if q in ("exit", "quit"):                # #24：镜像 voice 循环——退出不进 handle、不落遥测
+            break
         try:
             out = handle(q, resolver, cfg)
             print(out, "\n")

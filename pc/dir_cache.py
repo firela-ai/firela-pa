@@ -42,11 +42,48 @@ LOCAL_CAT_WORDS = {
     "超市采购": (_MARKET, ("Groceries",)),
     "超市": (_MARKET, ("Groceries",)),
     "买菜": (_MARKET, ("Groceries",)),
+    # #26 词族扩容（dogfood R1：33/36 类目槽 miss 的词表半边；enum 桶 ∈ vlt PayeeProfileCategory）
+    "就餐": (_REST, ("Dining",)),          # 外出就餐/账单-外出就餐（变体经下方包含归一）
+    "订阅": (("STREAMING",), ("Subscription",)),          # dev 账本 Expenses:Subscriptions 实存
+    "购物": (("ONLINE_SHOPPING", "SHOPPING_MALL"), ("Shopping",)),   # dir ONLINE_SHOPPING 22 条现成
+    "娱乐": (("ENTERTAINMENT",), ("Entertainment",)),
+    "教育": (("EDUCATION",), ("Education",)),
+    "买书": (("EDUCATION",), ("Education",)),             # spec 同 教育（同 spec 无归一歧义）
+    "油费": (("GAS_STATION",), ("Gas",)),      # account-standards 实测无 Fuel 路径（ Transportation:Gas 为准）
+    "水电": (("UTILITIES",), ("Utilities",)),             # 水电燃气经包含归一
+    "便利店": (("CONVENIENCE_STORE",), ("Convenience",)),
+    "房租": ((), ("Rent",)),               # 枚举无住房域（空枚举惯例同 外卖）
+    "rent": ((), ("Rent",)),               # rent杂费变体经包含归一
 }
 # 外卖平台 canonical 白名单（排除顺丰等快递公司对 subCategory=delivery 桶的污染）
 WAIMAI_WHITELIST = {"mt", "meituan", "meituan-waimai", "elm", "eleme"}
 
 _state = {"ts": 0.0, "profiles": []}     # 进程内缓存（serve-stale）
+
+
+def _probe_hit(probe, word):
+    """包含归一命中判定：中文探针=子串；ASCII 探针须词首（防 current/parent 误中 rent；
+    词首即命中允许派生后缀——educational ⊃ education）。"""
+    if not probe.isascii():
+        return probe in word
+    i = word.find(probe)
+    while i != -1:
+        if i == 0 or not (word[i - 1].isascii() and word[i - 1].isalnum()):
+            return True
+        i = word.find(probe, i + 1)
+    return False
+
+
+def _containment_spec(word):
+    """#26 变体归一：未知词含已知词（话费账单⊃话费；entertainment⊃Entertainment 段）→ (行 spec, 命中基词)。
+    命中多个不同 spec → 不猜（None → verbatim 旧路径）。"""
+    keys = {k for k in LOCAL_CAT_WORDS if _probe_hit(k.casefold(), word)}
+    keys |= {k for k, spec in LOCAL_CAT_WORDS.items()
+             for sg in spec[1] if _probe_hit(sg.casefold(), word)}
+    specs = {LOCAL_CAT_WORDS[k] for k in keys}
+    if len(specs) != 1:
+        return None, ()
+    return specs.pop(), tuple(keys)
 
 
 def _normalize(entry):
@@ -123,24 +160,29 @@ class Matcher:
             return self._cache[cat]
         word = cat.casefold()
         spec = LOCAL_CAT_WORDS.get(cat)
-        if spec is None:                    # 未知词（路由 p 槽原样）→ 旧版行为逐字保留
+        bases = ()                          # #26 变体归一命中的基词（并入两侧模式：话费账单→话费）
+        if spec is None:
+            spec, bases = _containment_spec(word)
+        if spec is None:                    # 真未知（路由 p 槽原样）→ 旧版行为逐字保留
             from orchestrator import CAT_SYNONYMS
             syn = CAT_SYNONYMS.get(cat, "")
             narr, acct = [word], [word] + ([syn.casefold()] if syn else [])
         else:
             enums, segs = spec
-            if not enums:                   # 外卖：白名单别名（无枚举桶）
+            bases = list(bases)
+            if not enums:                   # 空枚举：仅外卖 spec 走白名单（#26 后房租/rent 同空枚举，无别名）
                 aliases = []
-                for p in self._by_enum.get("OTHER", ()):
-                    if p["subcategory"] == "delivery" and p["canonical"] in WAIMAI_WHITELIST:
-                        aliases.append(p["canonical"])
-                        aliases.extend(p["aliases"])
-                narr = [word] + aliases
-                acct = [word] + [s.casefold() for s in segs]
+                if spec == LOCAL_CAT_WORDS["外卖"]:
+                    for p in self._by_enum.get("OTHER", ()):
+                        if p["subcategory"] == "delivery" and p["canonical"] in WAIMAI_WHITELIST:
+                            aliases.append(p["canonical"])
+                            aliases.extend(p["aliases"])
+                narr = [word] + bases + aliases
+                acct = [word] + bases + [s.casefold() for s in segs]
             else:
                 aliases = self._aliases(enums)
-                narr = [word] + aliases
-                acct = [word] + [s.casefold() for s in segs] + aliases
+                narr = [word] + bases + aliases
+                acct = [word] + bases + [s.casefold() for s in segs] + aliases
         self._cache[cat] = (narr, acct)
         return narr, acct
 
