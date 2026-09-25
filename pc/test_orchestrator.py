@@ -343,8 +343,9 @@ try:
         check("L-MARKER" in out, f"#23 概念题须走路由不进 sim（{q} → {out!r}）")
         check(len(_router_calls) == 1, f"#23 概念题须恰好进路由一次（{q}）")
 
-    # 个人时机题（时态动词+目标词）：进 sim，不进路由
-    for q in ("我什么时候能退休", "我什么时候能财务自由", "按现在这样还要多少年能退休"):
+    # 个人时机题（时态动词+目标词，含插动词变体「能实现」——test_eval_agent sim 首问实测）：进 sim，不进路由
+    for q in ("我什么时候能退休", "我什么时候能财务自由", "按现在这样还要多少年能退休",
+              "我什么时候能实现财务自由", "多久能达到财务自由"):
         _router_calls.clear()
         out = orchestrator.handle(q, _R(), _CFG23, entry="test")
         check("SIM-NARRATE-MARKER" in out, f"#23 个人时机题须进 sim（{q} → {out!r}）")

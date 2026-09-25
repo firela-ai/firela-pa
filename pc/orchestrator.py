@@ -933,8 +933,9 @@ def handle(question, resolver, cfg, entry="repl", trace=None, source="human"):
         import sim
         try:
             # #23：裸 FIRE/财务自由/financial independence 是概念标记词（gold 走 l/c）——
-            # 概念/讨论题回落受训路由器；钩子只收个人时机形态（时态动词+目标词）
-            if re.search(r"什么时候能(?:退休|财务自由)|多久能(?:退休|财务自由)|多少年能(?:退休|财务自由)|退休金够不够|when can i retire", resolved, re.I):
+            # 概念/讨论题回落受训路由器；钩子只收个人时机形态（时态动词+可选实现动词+目标词，
+            # 「什么时候能实现财务自由」=test_eval_agent sim 首问实测形态）
+            if re.search(r"(?:什么时候|多久|多少年)能(?:退休|(?:实现|达到|达成|攒到|攒够)?财务自由)|退休金够不够|when can i retire", resolved, re.I):
                 sim.reset(sim.ledger_params(Vlt(cfg), _TODAY()))
                 _prof = memory.get_profile()               # P9：档案覆写会话默认（首问重置后套用）
                 if "wr" in _prof:
